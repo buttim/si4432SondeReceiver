@@ -1,18 +1,17 @@
 #include <SPI.h>
-//#include <RadioLib.h>
 #include <CRC.h>
 #include <navduino.h>
 #include "Si4432.h"
+#include "rsc.h"
 
 const pin_size_t cs=1, sdn=5, irq=4, miso=0, mosi=3, sck=2, button=14;
 const int PACKET_LENGTH=316, CHUNK_SIZE=53;
+const uint32_t freq=403700; //hHz
 
 SPIClassRP2040 spi(spi0,miso,cs,sck,mosi);
 SPISettings spiSettings(1e6,MSBFIRST,SPI_MODE0);
-//Module m(cs,irq,-1,-1,spi,spiSettings);
-//Si4432 radio(&m);
 int nBytes=0;
-uint8_t buf[PACKET_LENGTH]={};
+uint8_t buf[800]={};
 uint8_t mask[] = {
     0x96, 0x83, 0x3E, 0x51, 0xB1, 0x49, 0x08, 0x98,
     0x32, 0x05, 0x59, 0x0E, 0xF9, 0x44, 0xC6, 0x26,
@@ -58,14 +57,66 @@ void f(void) {
   dump=true;
 }
 
-void radioIRQ(void) {
-  //Serial.println("***");
-}
+//taken from dxlAPRS
+static int32_t reedsolomon41(uint8_t buf[], uint32_t buf_len, uint32_t len2) {
+   uint32_t i;
+   int32_t res1;
+   /*tb1, */
+   int32_t res;
+   char b1[256];
+   char b[256];
+   uint32_t eraspos[24];
+   uint32_t tmp;
+   for (i = 0UL; i<=255UL; i++) {
+      b[i] = 0;
+      b1[i] = 0;
+   } /* end for */
+   tmp = len2;
+   i = 0UL;
+   if (i<=tmp) for (;; i++) {
+      b[230UL-i] = buf[i*2UL+56UL];
+      b1[230UL-i] = buf[i*2UL+57UL];
+      if (i==tmp) break;
+   } /* end for */
+   for (i = 0UL; i<=23UL; i++) {
+      b[254UL-i] = buf[i+8UL];
+      b1[254UL-i] = buf[i+32UL];
+   } /* end for */
+   res = decodersc(b, eraspos, 0);
+   res1 = decodersc(b1, eraspos, 0);
+   if (res>0L && res<=12L) {
+      tmp = len2;
+      i = 0UL;
+      if (i<=tmp) for (;; i++) {
+         buf[i*2UL+56UL] = b[230UL-i];
+         if (i==tmp) break;
+      } /* end for */
+      for (i = 0UL; i<=23UL; i++) {
+         buf[i+8UL] = b[254UL-i];
+      } /* end for */
+   }
+   if (res1>0L && res1<=12L) {
+      tmp = len2;
+      i = 0UL;
+      if (i<=tmp) for (;; i++) {
+         buf[i*2UL+57UL] = b1[230UL-i];
+         if (i==tmp) break;
+      } /* end for */
+      for (i = 0UL; i<=23UL; i++) {
+         buf[i+32UL] = b1[254UL-i];
+      } /* end for */
+   }
+   if (res<0L || res1<0L) return -1L;
+   else return res+res1;
+   return 0;
+} /* end reedsolomon41() */
 
 void setup() {
   Serial.begin(115200);
-  while (!Serial);
   Serial.println("VIA");
+
+  initrsc();
+  rp2040.wdt_begin(3000);
 
   pinMode(button, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(button),f,FALLING);
@@ -76,14 +127,7 @@ void setup() {
   digitalWrite(sdn,LOW);
 
   spi.begin();
-  /*int res=radio.begin(405.95);
-  if (res!=RADIOLIB_ERR_NONE) {
-    while (true) {
-      Serial.println("Errore inizializzazione Si4432");
-      delay(1000);
-    }
-  }*/
-  Serial.printf("radio ok (type: %02X,version: %02X)\n",Si44xxReadReg(0),Si44xxReadReg(1));
+  Serial.printf("radio module type: %02X,version: %02X\n",Si44xxReadReg(0),Si44xxReadReg(1));
 
   Si44xxWriteReg(0x07, 0x80); //software reset
   delay(100);
@@ -101,7 +145,6 @@ void setup() {
   Si44xxWriteReg(0x25,0x21);//(come da radiolib)
   Si44xxWriteReg(0x2A,0x50);//(come da radiolib)
   Si44xxWriteReg(0x69,0x60);//(come da radiolib)
-  Si44xxWriteReg(0x72,0x08);//(come da radiolib)
   Si44xxWriteReg(0x30,SI443X_LSB_FIRST_ON);//disabilita CRC e packet handling
   Si44xxWriteReg(0x32,0x00);//check 0 address bytes
   Si44xxWriteReg(0x33,0b00001110);//header length=0,no packet length in header,sync word length=4
@@ -109,17 +152,14 @@ void setup() {
   Si44xxWriteReg(0x35,(15<<3)|0b010);//preamble length threshold (rssi_offset=8dB, default)
   Si44xxWriteReg(0x70,0b00100000);//txdtrtscale, no data whitening
   Si44xxWriteReg(0x71,0b00100011);//Modulation GFSK (forse 0x22?)
+  Si44xxWriteReg(0x72,0x05);//Frequency deviation 3100Hz (/625)
 
-  Si44xxWriteReg(0x75,0x50);//Frequency band select
-  Si44xxWriteReg(0x76,0x94);//Nominal carrier frequency 1 (405.95)
-  Si44xxWriteReg(0x77,0xC0);//Nominal carrier frequency 0 (405.95)
+  Si44xxWriteReg(0x75,0x50);//Frequency band select (400MHz)
+  Si44xxWriteReg(0x76,((int)((freq-400000)*6.4))>>8);//Nominal carrier frequency 1
+  Si44xxWriteReg(0x77,((int)((freq-400000)*6.4))&0xFF);//Nominal carrier frequency 0
   
   Si44xxWriteReg(0x7E,CHUNK_SIZE-1);//RX FIFO almost full threshold
   
-  //dumpRegisters();
-
-  attachInterrupt(digitalPinToInterrupt(irq),radioIRQ,FALLING);
-
   startReceive();
 }
 
@@ -138,7 +178,8 @@ void loop() {
   int i;
   static uint32_t tLast=0;
 
-  //delay(100);
+  rp2040.wdt_reset();
+
   if (dump) {
     dump=false;
     Serial.print("nBytes=");
@@ -154,13 +195,13 @@ void loop() {
     Serial.println();
   }
 
-  if (millis()-tLast>1200) {
+  /*if (millis()-tLast>1200) {
     nBytes=0;
     startReceive();
     tLast=millis();
     Serial.println("*****************");
     return;
-  }
+  }*/
 
   int is2=Si44xxReadReg(4), //interrupt/status 2
     is1=Si44xxReadReg(3); //interrupt/status 1
@@ -176,10 +217,27 @@ void loop() {
   startReceive();
 
   for (i=0;i<PACKET_LENGTH;i++) buf[i]^=mask[(i+4)%sizeof mask];  //whitening
+
+	int res = reedsolomon41(buf-4, 560, 131);  // try short frame first
+	if(res<0)
+		res = reedsolomon41(buf-4, 560, 230);  // try long frame
+
+  if (res<0) {
+    Serial.println("--------RS decode failed--------\n");
+    return;
+  }
+  /*Serial.println("uint8_t data[]={");
+  for (i=0;i<PACKET_LENGTH;i++) {
+    Serial.printf("0x%02X,",buf[i]);
+    if (i%16==15)
+      Serial.printf("//0x%03X\n",i-15);
+  }
+  Serial.println("};");*/
+  //TODO: error correction
   /*Serial.print("\nRSEC: ");
   for (i=4;i<4+48;i++) 
     Serial.printf("%02X ",buf[4+i]);*/
-  Serial.printf("\nFrame: %02X ",buf[4+48]);
+  Serial.printf("\n%d: Frame: %02X ",millis()/1000,buf[4+48]);
   i=4+48+1;
   while (i<PACKET_LENGTH) {
     int blockType=buf[i++],
@@ -213,4 +271,5 @@ void loop() {
       }
     i+=len+2;
   }
+  Serial.println("-------------------------------");
 }
